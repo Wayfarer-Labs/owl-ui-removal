@@ -1,0 +1,31 @@
+# Large model checkpoints
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+checkpoints/*.safetensors
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Results and temporary files
+results/
+*.tmp
+*.temp
+
+# Grounded-SAM-2 repository (if cloned)
+Grounded-SAM-2/
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+
+# System files
+.DS_Store
