@@ -1,0 +1,24 @@
+detection:
+  box_threshold: 0.2
+  prompt_type: mask
+  text_prompt: text, button, icon, menu, interface, element
+  text_threshold: 0.2
+model:
+  device: auto
+  grounding_model_id: IDEA-Research/grounding-dino-tiny
+  sam2_checkpoint: ./checkpoints/sam2.1_hiera_large.pt
+  sam2_config: configs/sam2.1/sam2.1_hiera_l.yaml
+  use_bfloat16: true
+output:
+  export_coco: false
+  export_video: false
+  output_dir: ./results
+  video_fps: 30.0
+  visualization_alpha: 0.4
+tracking:
+  max_frames: null
+  save_annotations: true
+  save_combined_masks: true
+  save_individual_masks: true
+  save_visualizations: true
+  step_size: 10

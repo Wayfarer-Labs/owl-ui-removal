@@ -1,0 +1,29 @@
+
+# Example configuration for UI tracking
+model:
+  sam2_checkpoint: "./checkpoints/sam2.1_hiera_large.pt"
+  sam2_config: "./configs/sam2.1/sam2.1_hiera_l.yaml"
+  grounding_model_id: "IDEA-Research/grounding-dino-tiny"
+  device: "auto"
+  use_bfloat16: true
+
+detection:
+  text_prompt: "button, menu, icon, text field, dropdown, checkbox, slider, tab, dialog, popup, toolbar, navigation bar, status bar, scroll bar"
+  box_threshold: 0.25
+  text_threshold: 0.25
+  prompt_type: "mask"
+
+tracking:
+  step_size: 10
+  max_frames: null
+  save_visualizations: true
+  save_individual_masks: true
+  save_combined_masks: true
+  save_annotations: true
+
+output:
+  output_dir: "./results"
+  export_coco: false
+  export_video: false
+  video_fps: 30.0
+  visualization_alpha: 0.4
