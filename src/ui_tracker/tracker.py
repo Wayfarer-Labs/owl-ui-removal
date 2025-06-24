@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import logging
 from tqdm import tqdm
 
-# SAM2 imports (assuming Grounded-SAM2 is installed)
+# SAM2 imports (assuming Grounded-SAM-2 is installed)
 try:
     from sam2.build_sam import build_sam2_video_predictor, build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -293,8 +293,13 @@ class UIElementTracker:
         video_segments = {}
         object_count = 0
         
+        # Strategy: Initialize objects in first few frames, then track consistently
+        detected_objects = {}  # Store consistent object mappings
+        object_templates = {}  # Store object templates for matching
+        max_objects = 4  # Expected number of UI objects
+        
         # Process frames in chunks
-        for start_idx in tqdm(range(0, len(frame_files), step_size), desc="Processing frames"):
+        for i, start_idx in enumerate(tqdm(range(0, len(frame_files), step_size), desc="Processing frames")):
             frame_idx = start_idx
             if frame_idx >= len(frame_files):
                 break
@@ -310,57 +315,25 @@ class UIElementTracker:
             
             if len(boxes) == 0:
                 self.logger.info(f"No UI elements detected in frame {frame_idx}")
-                continue
-                
-            # Generate masks
-            masks, mask_scores, logits = self.generate_masks_for_boxes(image_rgb, boxes)
-            
-            if len(masks) == 0:
+                # For tracking consistency, still propagate existing objects
+                if detected_objects:
+                    self._propagate_existing_objects(inference_state, frame_idx, video_segments)
                 continue
             
-            # Reset video predictor state for new objects
-            self.video_predictor.reset_state(inference_state)
+            # If this is early in the sequence and we haven't found all objects yet
+            if len(detected_objects) < max_objects and i < 10:  # Search in first 10 detection frames
+                self._initialize_or_update_objects(
+                    inference_state, frame_idx, image_rgb, boxes, labels, scores,
+                    detected_objects, object_templates, prompt_type
+                )
+            else:
+                # We have our core objects, now just track them
+                self._track_existing_objects(
+                    inference_state, frame_idx, image_rgb, boxes, labels, scores,
+                    detected_objects, object_templates, prompt_type
+                )
             
-            # Add masks to video predictor
-            frame_objects = {}
-            for obj_idx, (label, mask, score) in enumerate(zip(labels, masks, scores)):
-                object_id = object_count + 1 + obj_idx
-                
-                # Ensure mask is 2D as expected by SAM2
-                if mask.ndim > 2:
-                    mask = mask.squeeze()
-                if mask.ndim != 2:
-                    logging.warning(f"Mask for object {obj_idx} has wrong dimensions: {mask.shape}, skipping")
-                    continue
-                
-                if prompt_type == "mask":
-                    _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_mask(
-                        inference_state=inference_state,
-                        frame_idx=frame_idx,
-                        obj_id=object_id,
-                        mask=mask
-                    )
-                elif prompt_type == "box":
-                    box = boxes[obj_idx]
-                    _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=frame_idx,
-                        obj_id=object_id,
-                        box=box
-                    )
-                else:
-                    raise ValueError(f"Unsupported prompt type: {prompt_type}")
-                
-                frame_objects[object_id] = {
-                    'mask': mask,
-                    'label': label,
-                    'score': score,
-                    'box': boxes[obj_idx] if len(boxes) > obj_idx else None
-                }
-            
-            object_count += len(masks)
-            
-            # Propagate through video frames
+            # Propagate through video frames for all detected objects
             chunk_segments = {}
             for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
                 inference_state, 
@@ -375,6 +348,11 @@ class UIElementTracker:
                 chunk_segments[out_frame_idx] = frame_masks
                 
             video_segments.update(chunk_segments)
+                
+            video_segments.update(chunk_segments)
+        
+        # Apply temporal filtering to improve consistency
+        # video_segments = self._temporal_filter_masks(video_segments, min_frames=2)
         
         # Save results
         self._save_tracking_results(
@@ -612,7 +590,299 @@ class UIElementTracker:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color.tolist(), 2)
         
         return vis_image
+    
+    def _match_objects_with_tracking(
+        self, 
+        boxes: np.ndarray, 
+        labels: List[str], 
+        scores: np.ndarray,
+        tracking_objects: Dict[int, Dict],
+        current_frame: int,
+        iou_threshold: float = 0.5,
+        max_frame_gap: int = 30
+    ) -> Tuple[Dict[int, Tuple], Dict[int, Tuple]]:
+        """
+        Match detected boxes with existing tracked objects using IoU overlap.
+        
+        Args:
+            boxes: Detected bounding boxes in current frame
+            labels: Detected labels
+            scores: Detection scores  
+            tracking_objects: Currently tracked objects
+            current_frame: Current frame index
+            iou_threshold: Minimum IoU for matching
+            max_frame_gap: Maximum frames since last detection
+            
+        Returns:
+            Tuple of (matched_objects, new_objects)
+        """
+        def calculate_iou(box1, box2):
+            """Calculate IoU between two boxes [x1, y1, x2, y2]"""
+            x1 = max(box1[0], box2[0])
+            y1 = max(box1[1], box2[1])
+            x2 = min(box1[2], box2[2])
+            y2 = min(box1[3], box2[3])
+            
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+                
+            intersection = (x2 - x1) * (y2 - y1)
+            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+            area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+            union = area1 + area2 - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        matched_objects = {}
+        used_boxes = set();
+        
+        # First, try to match with recently active objects
+        active_objects = {
+            obj_id: obj_data for obj_id, obj_data in tracking_objects.items()
+            if obj_data['active'] and (current_frame - obj_data['last_frame']) <= max_frame_gap
+        }
+        
+        # Match boxes with active tracked objects
+        for obj_id, obj_data in active_objects.items():
+            last_box = obj_data['last_box']
+            best_iou = 0.0
+            best_box_idx = -1
+            
+            for box_idx, box in enumerate(boxes):
+                if box_idx in used_boxes:
+                    continue;
+                    
+                iou = calculate_iou(last_box, box)
+                if iou > best_iou and iou >= iou_threshold:
+                    best_iou = iou
+                    best_box_idx = box_idx
+            
+            if best_box_idx >= 0:
+                matched_objects[obj_id] = (
+                    best_box_idx, boxes[best_box_idx], 
+                    labels[best_box_idx], scores[best_box_idx]
+                )
+                used_boxes.add(best_box_idx)
+        
+        # Mark unmatched objects as inactive
+        for obj_id in active_objects:
+            if obj_id not in matched_objects:
+                tracking_objects[obj_id]['active'] = False
+        
+        # Collect unmatched boxes as new objects
+        new_objects = {}
+        for box_idx, (box, label, score) in enumerate(zip(boxes, labels, scores)):
+            if box_idx not in used_boxes:
+                new_objects[box_idx] = (box, label, score)
+        
+        return matched_objects, new_objects
+    
+    def _temporal_filter_masks(
+        self, 
+        video_segments: Dict[int, Dict[int, np.ndarray]], 
+        min_frames: int = 3
+    ) -> Dict[int, Dict[int, np.ndarray]]:
+        """
+        Filter out objects that appear in too few frames to reduce noise.
+        
+        Args:
+            video_segments: Raw tracking results
+            min_frames: Minimum number of frames an object must appear in
+            
+        Returns:
+            Filtered tracking results
+        """
+        # Count frames per object
+        object_frame_counts = {}
+        for frame_idx, frame_masks in video_segments.items():
+            for obj_id in frame_masks.keys():
+                object_frame_counts[obj_id] = object_frame_counts.get(obj_id, 0) + 1
+        
+        # Filter objects that appear too infrequently
+        valid_objects = {
+            obj_id for obj_id, count in object_frame_counts.items() 
+            if count >= min_frames
+        }
+        
+        # Remove invalid objects from results
+        filtered_segments = {}
+        for frame_idx, frame_masks in video_segments.items():
+            filtered_masks = {
+                obj_id: mask for obj_id, mask in frame_masks.items()
+                if obj_id in valid_objects
+            }
+            if filtered_masks:  # Only include frames with valid objects
+                filtered_segments[frame_idx] = filtered_masks
+        
+        removed_count = len(object_frame_counts) - len(valid_objects)
+        if removed_count > 0:
+            self.logger.info(f"Filtered out {removed_count} objects that appeared in fewer than {min_frames} frames")
+        
+        return filtered_segments
 
+    def _calculate_box_iou(self, box1, box2):
+        """Calculate IoU between two bounding boxes."""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection area
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _match_detections_to_objects(self, boxes, detected_objects, iou_threshold=0.3):
+        """Match current detections to existing objects."""
+        matches = {}
+        unmatched_detections = list(range(len(boxes)))
+        
+        for obj_id, obj_data in detected_objects.items():
+            best_match = -1
+            best_iou = 0
+            
+            for det_idx in unmatched_detections:
+                iou = self._calculate_box_iou(boxes[det_idx], obj_data['box'])
+                if iou > best_iou and iou > iou_threshold:
+                    best_iou = iou
+                    best_match = det_idx
+            
+            if best_match >= 0:
+                matches[obj_id] = best_match
+                unmatched_detections.remove(best_match)
+        
+        return matches, unmatched_detections
+    
+    def _initialize_or_update_objects(self, inference_state, frame_idx, image, boxes, labels, scores, 
+                                    detected_objects, object_templates, prompt_type):
+        """Initialize new objects or update existing ones in early frames."""
+        # Generate masks for all detections
+        masks, mask_scores, logits = self.generate_masks_for_boxes(image, boxes)
+        
+        if len(masks) == 0:
+            return
+        
+        # Match to existing objects
+        matches, unmatched = self._match_detections_to_objects(boxes, detected_objects)
+        
+        # Update existing objects
+        for obj_id, det_idx in matches.items():
+            # Update the object's position but keep the same SAM2 tracking
+            detected_objects[obj_id]['box'] = boxes[det_idx]
+            detected_objects[obj_id]['last_seen'] = frame_idx
+        
+        # Add new objects for unmatched detections
+        for det_idx in unmatched:
+            if len(detected_objects) >= 4:  # Limit to 4 objects as specified
+                break
+                
+            new_obj_id = len(detected_objects) + 1
+            mask = masks[det_idx]
+            
+            # Ensure mask is 2D
+            if mask.ndim > 2:
+                mask = mask.squeeze()
+            if mask.ndim != 2:
+                continue
+            
+            # Add to SAM2 video predictor
+            try:
+                if prompt_type == "mask":
+                    self.video_predictor.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=new_obj_id,
+                        mask=mask
+                    )
+                elif prompt_type == "box":
+                    self.video_predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=new_obj_id,
+                        box=boxes[det_idx]
+                    )
+                
+                # Store object information
+                detected_objects[new_obj_id] = {
+                    'box': boxes[det_idx],
+                    'label': labels[det_idx],
+                    'score': scores[det_idx],
+                    'first_seen': frame_idx,
+                    'last_seen': frame_idx
+                }
+                
+                self.logger.info(f"Initialized new UI object {new_obj_id} at frame {frame_idx}")
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to add new object {new_obj_id}: {e}")
+    
+    def _track_existing_objects(self, inference_state, frame_idx, image, boxes, labels, scores,
+                              detected_objects, object_templates, prompt_type):
+        """Track existing objects, updating positions for moving objects."""
+        # Match detections to existing objects
+        matches, unmatched = self._match_detections_to_objects(boxes, detected_objects)
+        
+        # Update matched objects (especially important for moving objects)
+        for obj_id, det_idx in matches.items():
+            old_box = detected_objects[obj_id]['box']
+            new_box = boxes[det_idx]
+            
+            # Check if object moved significantly (could be the moving object)
+            iou = self._calculate_box_iou(old_box, new_box)
+            if iou < 0.8:  # Object moved significantly
+                self.logger.debug(f"Object {obj_id} moved significantly (IoU: {iou:.3f})")
+                
+                # Generate new mask for moved object
+                masks, _, _ = self.generate_masks_for_boxes(image, [new_box])
+                if len(masks) > 0:
+                    mask = masks[0]
+                    if mask.ndim > 2:
+                        mask = mask.squeeze()
+                    if mask.ndim == 2:
+                        try:
+                            # Add updated mask position to SAM2
+                            self.video_predictor.add_new_mask(
+                                inference_state=inference_state,
+                                frame_idx=frame_idx,
+                                obj_id=obj_id,
+                                mask=mask
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to update object {obj_id}: {e}")
+            
+            # Update object data
+            detected_objects[obj_id]['box'] = new_box
+            detected_objects[obj_id]['last_seen'] = frame_idx
+    
+    def _propagate_existing_objects(self, inference_state, frame_idx, video_segments):
+        """Propagate existing objects when no new detections are found."""
+        try:
+            # Just propagate existing objects without adding new ones
+            chunk_segments = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
+                inference_state, 
+                max_frame_num_to_track=1, 
+                start_frame_idx=frame_idx
+            ):
+                if out_frame_idx == frame_idx:  # Only current frame
+                    frame_masks = {}
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                        frame_masks[out_obj_id] = mask[0] if mask.ndim > 2 else mask
+                    
+                    video_segments[out_frame_idx] = frame_masks
+                    break
+        except Exception as e:
+            self.logger.warning(f"Failed to propagate objects at frame {frame_idx}: {e}")
 
 def create_ui_tracker(
     sam2_checkpoint: Optional[str] = None,

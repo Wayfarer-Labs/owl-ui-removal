@@ -1,9 +1,9 @@
 detection:
   box_threshold: 0.2
   prompt_type: mask
-  text_prompt: text, numbers,  button, icon, menu, interface, element, health bar,
-    minimap, inventory, menu, pop up, overlay, hub, portrait, compass, talking head
-  text_threshold: 0.1
+  text_prompt: text, button, icon, menu, interface, element, health bar, minimap,
+    inventory, menu, pop up, overlay, hub, portrait, compass, talking head
+  text_threshold: 0.2
 model:
   device: auto
   grounding_model_id: IDEA-Research/grounding-dino-tiny
@@ -22,4 +22,4 @@ tracking:
   save_combined_masks: true
   save_individual_masks: true
   save_visualizations: true
-  step_size: 10
+  step_size: 1
