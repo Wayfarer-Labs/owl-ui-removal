@@ -63,7 +63,10 @@ def create_multi_mask_overlay(
     Returns:
         Image with multi-mask overlay
     """
-    overlay = image.copy()
+    if not masks:
+        return image.copy()
+    
+    overlay = image.copy().astype(np.float32)
     
     # Generate colors if not provided
     if colors is None:
@@ -76,22 +79,48 @@ def create_multi_mask_overlay(
         for i, obj_id in enumerate(masks.keys()):
             colors[obj_id] = color_palette[i % len(color_palette)]
     
-    # Apply each mask
+    # Create a combined mask overlay
+    combined_overlay = np.zeros_like(image, dtype=np.float32)
+    combined_mask = np.zeros(image.shape[:2], dtype=np.float32)
+    
+    # Apply each mask to the combined overlay
     for obj_id, mask in masks.items():
         color = colors.get(obj_id, (255, 255, 255))
         
-        # Ensure mask is binary
-        mask_binary = (mask > 0.5).astype(np.uint8)
+        # Ensure mask is binary and normalize
+        mask_binary = (mask > 0.5).astype(np.float32)
         
         if np.any(mask_binary):
-            # Create colored mask
-            colored_mask = np.zeros_like(image)
-            colored_mask[mask_binary == 1] = color
-            
-            # Blend with current overlay
-            overlay = cv2.addWeighted(overlay, 1 - alpha, colored_mask, alpha, 0)
+            # Add colored mask to combined overlay
+            for c in range(3):
+                combined_overlay[:, :, c] += mask_binary * color[c]
+            combined_mask = np.maximum(combined_mask, mask_binary)
     
-    return overlay
+    # Normalize the combined overlay where masks overlap
+    mask_counts = np.zeros_like(combined_mask)
+    for mask in masks.values():
+        mask_binary = (mask > 0.5).astype(np.float32)
+        mask_counts += mask_binary
+    
+    # Avoid division by zero
+    mask_counts = np.maximum(mask_counts, 1.0)
+    
+    # Normalize overlapping areas
+    for c in range(3):
+        combined_overlay[:, :, c] = np.where(
+            combined_mask > 0,
+            combined_overlay[:, :, c] / mask_counts,
+            0
+        )
+    
+    # Blend with original image only once
+    result = np.where(
+        combined_mask[..., np.newaxis] > 0,
+        overlay * (1 - alpha) + combined_overlay * alpha,
+        overlay
+    )
+    
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def draw_bounding_boxes(
